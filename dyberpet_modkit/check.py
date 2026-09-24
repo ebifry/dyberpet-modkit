@@ -94,20 +94,48 @@ def check_required_keys(module_dir: str):
     return [k for k in INIT_HARD_KEYS if k not in pet]
 
 
+#: 动作名前缀，命中这些前缀的动作视为「过场动画」，不做帧一致性检查。
+#: 理由：过场（变身 / 转场）的本质就是**每帧轮廓不同**（收缩、发光、位移），
+#: 要求帧间像素一致等于要求过场不做动画。官方那条硬约束针对的是**循环动作**
+#: （playlist 里的 idle / walk 之类），循环动作帧间跳动才会被看成「抖」。
+TRANSITION_PREFIXES = (
+    "to_", "transition_", "transform_", "prefall_", "intro_", "outro_",
+)
+
+
+def _is_transition(name: str, images: str) -> bool:
+    """判断一个动作是否属于「过场动画」（帧间允许不一致）。"""
+    for token in (name, images):
+        if not token:
+            continue
+        low = token.lower()
+        if any(low.startswith(p) for p in TRANSITION_PREFIXES):
+            return True
+    return False
+
+
 def check_frame_consistency(module_dir: str):
     """检查同一动作的所有帧，画布尺寸与非透明像素数是否一致。
 
-    返回 ``(bad_list, skipped)``。未安装 Pillow 时 ``skipped=True``。
+    返回 ``(bad_list, skipped, excused)``：
+
+    * ``bad_list``  —— 真正有问题的循环动作
+    * ``skipped``   —— 未安装 Pillow
+    * ``excused``   —— 判定为过场动画而豁免检查的动作名
+
+    画布尺寸（``sizes``）对**所有**动作都必须一致 —— 尺寸不统一会让窗口跳；
+    非透明像素数只对循环动作强制 —— 过场动画的像素数本来就该逐帧变化。
     """
     try:
         from PIL import Image
     except ImportError:
-        return [], True
+        return [], True, []
 
     with open(os.path.join(module_dir, "act_conf.json"), encoding="utf-8") as f:
         act = json.load(f)
 
     bad = []
+    excused = []
     action_dir = os.path.join(module_dir, "action")
     for name, dic in act.items():
         images = dic.get("images")
@@ -124,9 +152,18 @@ def check_frame_consistency(module_dir: str):
             im = Image.open(fp).convert("RGBA")
             sizes.add(im.size)
             counts.add(sum(im.getchannel("A").histogram()[1:]))
-        if len(sizes) > 1 or len(counts) > 1:
-            bad.append((name, images, sizes, counts))
-    return bad, False
+
+        is_trans = _is_transition(name, images)
+        if is_trans:
+            excused.append((name, images))
+        # 尺寸：任何动作都必须一致
+        size_bad = len(sizes) > 1
+        # 像素数：只有循环动作必须一致
+        count_bad = (len(counts) > 1) and not is_trans
+        if size_bad or count_bad:
+            bad.append((name, images, sizes, counts, size_bad, count_bad, is_trans))
+    return bad, False, excused
+
 
 
 def validate(module_dir: str, repo: str | None = None) -> int:
@@ -155,18 +192,27 @@ def validate(module_dir: str, repo: str | None = None) -> int:
         ok = False
 
     try:
-        bad, skipped = check_frame_consistency(module_dir)
+        bad, skipped, excused = check_frame_consistency(module_dir)
         if skipped:
-            print("[帧尺寸一致性]    跳过（未安装 Pillow）")
+            print("[帧一致性]        跳过（未安装 Pillow）")
         elif bad:
-            print("[帧尺寸一致性]    ❌ 不一致:")
-            for name, images, sizes, counts in bad:
+            print("[帧一致性]        ❌ 有问题:")
+            for name, images, sizes, counts, size_bad, count_bad, is_trans in bad:
+                why = []
+                if size_bad:
+                    why.append("画布尺寸不一致")
+                if count_bad:
+                    why.append("非透明像素数不一致")
                 print(f"    {name} (images={images}) sizes={sizes} 非透明像素={counts}")
+                print(f"      → 问题：{'；'.join(why)}")
             ok = False
         else:
-            print("[帧尺寸一致性]    OK —— 所有动作各帧尺寸与非透明像素数一致")
+            extra = ""
+            if excused:
+                extra = f"（豁免过场动画 {len(excused)} 个：{', '.join(n for n, _ in excused)}）"
+            print(f"[帧一致性]        OK —— 循环动作各帧尺寸与像素数一致{extra}")
     except Exception as exc:  # noqa: BLE001
-        print(f"[帧尺寸一致性]    跳过（{exc}）")
+        print(f"[帧一致性]        跳过（{exc}）")
 
     print("\n结论:", "✅ 通过" if ok else "❌ 未通过")
     return 0 if ok else 1
